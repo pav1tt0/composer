@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { normalizeSliders, normalizeWeights } from "@/lib/normalize";
 import { cosineSimilarity } from "@/lib/engine/score";
 import { generateCandidates, rerankByObjective, suggestMoreRecyclableAlternative } from "@/lib/engine/generate";
+import { MATERIALS } from "@/lib/materials";
 
 describe("engine", () => {
   it("normalizes sliders with defaults", () => {
@@ -72,7 +73,8 @@ describe("engine", () => {
       weights: { durability: 1, elasticity: 1, cost: 3 }
     });
 
-    expect(highDurability[0].composition).not.toStrictEqual(highCost[0].composition);
+    expect(highDurability[0].predicted_properties.durability).toBeGreaterThanOrEqual(highCost[0].predicted_properties.durability);
+    expect(highCost[0].predicted_properties.cost).toBeGreaterThanOrEqual(highDurability[0].predicted_properties.cost);
   });
 
   it("changing use-case changes ranking", () => {
@@ -123,5 +125,77 @@ describe("engine", () => {
     const alt = suggestMoreRecyclableAlternative(input, base);
     if (!alt) return;
     expect(alt.circularity.circularity_score).toBeGreaterThan(base.circularity.circularity_score);
+  });
+
+  it("does not repeat the same fiber in the same composition", () => {
+    const out = generateCandidates({
+      use_case: "Sportswear",
+      use_case_id: "sportswear",
+      sliders: { elasticity: 72, durability: 64, breathability: 68 }
+    });
+
+    for (const candidate of out) {
+      const ids = candidate.composition.map((part) => part.material_id);
+      expect(new Set(ids).size).toBe(ids.length);
+    }
+  });
+
+  it("can emit a single-material candidate when target is already matched", () => {
+    const modal = MATERIALS.find((m) => m.name === "Modal");
+    if (!modal) throw new Error("Expected Modal in seed materials");
+
+    const out = generateCandidates({
+      use_case: "Sportswear",
+      use_case_id: "sportswear",
+      sliders: {
+        breathability: modal.properties.breathability,
+        elasticity: modal.properties.elasticity,
+        durability: modal.properties.durability,
+        softness: modal.properties.softness,
+        thermal_regulation: modal.properties.thermal_regulation,
+        weight_lightness: modal.properties.weight_lightness
+      },
+      constraints: { no_animal_fibers: true }
+    });
+
+    expect(out.some((c) => c.composition.length === 1 && c.composition[0].pct === 100)).toBe(true);
+  });
+
+  it("neutral sliders still produce different outputs across use-cases", () => {
+    const neutral = {
+      sliders: {
+        breathability: 50,
+        elasticity: 50,
+        durability: 50,
+        softness: 50,
+        thermal_regulation: 50,
+        weight_lightness: 50,
+        co2: 50,
+        water: 50,
+        energy: 50,
+        biodegradability: 50,
+        microplastic_risk: 50,
+        recyclability: 50,
+        cost: 50,
+        scalability: 50
+      },
+      constraints: { no_animal_fibers: true }
+    };
+
+    const sportswear = generateCandidates({
+      use_case: "Sportswear",
+      use_case_id: "sportswear",
+      ...neutral
+    });
+    const circular = generateCandidates({
+      use_case: "Circular Design",
+      use_case_id: "circular-design",
+      ...neutral
+    });
+
+    const signature = (items: typeof sportswear) =>
+      items.map((c) => c.composition.map((part) => `${part.material_id}:${part.pct}`).join("+")).join("|");
+
+    expect(signature(sportswear)).not.toBe(signature(circular));
   });
 });

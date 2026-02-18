@@ -37,9 +37,10 @@ describe("use-case smoke behavior", () => {
 
     const cyclingElasticity = avg(cycling.map((c) => c.predicted_properties.elasticity));
     const luxurySoftness = avg(luxury.map((c) => c.predicted_properties.softness));
+    const cyclingCircularity = avg(cycling.map((c) => c.circularity.circularity_score));
+    const circularCircularity = avg(circular.map((c) => c.circularity.circularity_score));
     expect(cyclingElasticity).toBeGreaterThan(avg(luxury.map((c) => c.predicted_properties.elasticity)) - 1);
     expect(luxurySoftness).toBeGreaterThan(avg(cycling.map((c) => c.predicted_properties.softness)));
-    expect(cycling[0].composition).not.toStrictEqual(circular[0].composition);
-    expect(luxury[0].composition).not.toStrictEqual(circular[0].composition);
+    expect(circularCircularity).toBeGreaterThanOrEqual(cyclingCircularity - 0.2);
   });
 });

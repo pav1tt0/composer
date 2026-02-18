@@ -76,6 +76,61 @@ function adjustWeightsForUseCase(baseWeights: Record<MetricKey, number>, useCase
   return out;
 }
 
+function computeNeutrality(target: Record<MetricKey, number>): number {
+  const deviation = Object.values(target).reduce((sum, value) => sum + Math.abs(value - 50), 0) / Object.keys(target).length;
+  const normalized = Math.max(0, Math.min(1, deviation / 35));
+  return Number((1 - normalized).toFixed(3));
+}
+
+function buildEffectiveTarget(
+  userTarget: Record<MetricKey, number>,
+  useCase: UseCaseConfig
+): { target: Record<MetricKey, number>; neutrality: number } {
+  const neutrality = computeNeutrality(userTarget);
+  const blendFactor = 0.8 * neutrality;
+  if (!useCase.target_hint || blendFactor <= 0.01) return { target: userTarget, neutrality };
+
+  const out = { ...userTarget };
+  for (const [metric, hintValue] of Object.entries(useCase.target_hint)) {
+    const key = metric as MetricKey;
+    const hint = Math.max(0, Math.min(100, Number(hintValue)));
+    const current = out[key];
+    out[key] = Number((current * (1 - blendFactor) + hint * blendFactor).toFixed(2));
+  }
+  return { target: out, neutrality };
+}
+
+function materialMicroRiskScore(material: Material): number {
+  if (material.constraints.microplastic_risk === "low") return 2;
+  if (material.constraints.microplastic_risk === "medium") return 5;
+  return 9;
+}
+
+function materialUseCaseAffinity(material: Material, useCase: UseCaseConfig): number {
+  let score = 0;
+  const family = categoryFamily(material.category);
+  const preferred = new Set((useCase.material_preferences?.preferred_families ?? []).map((v) => v.toUpperCase()));
+  const discouraged = new Set((useCase.material_preferences?.discouraged_families ?? []).map((v) => v.toUpperCase()));
+
+  if (preferred.has(family)) score += 0.14;
+  if (discouraged.has(family)) score -= 0.18;
+
+  const constraints = useCase.constraints;
+  if (constraints?.no_elastane && hasElastomer(material.name)) score -= 0.2;
+
+  if (typeof constraints?.max_microplastic_risk === "number") {
+    const over = materialMicroRiskScore(material) - constraints.max_microplastic_risk;
+    if (over > 0) score -= over * 0.03;
+  }
+  if (typeof constraints?.must_be_recyclable_min === "number") {
+    const materialRecyclability = (material.properties.recyclability ?? 50) / 10;
+    const gap = constraints.must_be_recyclable_min - materialRecyclability;
+    if (gap > 0) score -= gap * 0.02;
+  }
+
+  return score;
+}
+
 function candidateUseCaseObjective(candidate: Candidate, useCase: UseCaseConfig): number {
   const perf = avg(PERFORMANCE_METRICS.map((k) => candidate.predicted_properties[k] ?? 50)) / 100;
   const sust = avg(SUSTAINABILITY_METRICS.map((k) => candidate.predicted_properties[k] ?? 50)) / 100;
@@ -163,6 +218,19 @@ function roundComposition(parts: CompositionPart[]): CompositionPart[] {
   return rounded;
 }
 
+function normalizeComposition(parts: CompositionPart[]): CompositionPart[] {
+  const byId = new Map<string, CompositionPart>();
+  for (const part of parts) {
+    const existing = byId.get(part.material_id);
+    if (existing) {
+      existing.pct += part.pct;
+    } else {
+      byId.set(part.material_id, { ...part });
+    }
+  }
+  return roundComposition([...byId.values()]);
+}
+
 function makeComposition(base: Material, secondary: Material, additive: Material, rand: () => number): CompositionPart[] {
   const b = 50 + Math.floor(rand() * 21); // 50-70
   const sMax = Math.min(40, 95 - b); // keep at least 5% for additive
@@ -170,11 +238,29 @@ function makeComposition(base: Material, secondary: Material, additive: Material
   const s = sMin + Math.floor(rand() * (sMax - sMin + 1));
   const a = 100 - b - s;
 
-  return roundComposition([
+  return normalizeComposition([
     { material_id: base.id, name: base.name, pct: b },
     { material_id: secondary.id, name: secondary.name, pct: s },
     { material_id: additive.id, name: additive.name, pct: a }
   ]);
+}
+
+function makeSingleMaterialComposition(material: Material): CompositionPart[] {
+  return [{ material_id: material.id, name: material.name, pct: 100 }];
+}
+
+function pickDistinctMaterial(pool: Material[], excludedIds: Set<string>): Material | null {
+  for (const material of pool) {
+    if (!excludedIds.has(material.id)) return material;
+  }
+  return null;
+}
+
+function compositionKey(composition: CompositionPart[]): string {
+  return composition
+    .map((part) => `${part.material_id}:${part.pct}`)
+    .sort()
+    .join("|");
 }
 
 function buildExplanation(candidate: Candidate): Pick<Candidate, "explanation" | "manufacturing_notes" | "risks"> {
@@ -341,7 +427,8 @@ export function findSimilarMaterialsFromCatalog(catalog: Material[], targetMater
 export function generateCandidates(input: SessionInput, materials: Material[] = MATERIALS): Candidate[] {
   const useCaseId = resolveUseCaseId(input);
   const useCase = getUseCaseById(useCaseId);
-  const target = normalizeSliders(input.sliders);
+  const userTarget = normalizeSliders(input.sliders);
+  const { target, neutrality } = buildEffectiveTarget(userTarget, useCase);
   const weights = adjustWeightsForUseCase(normalizeWeights(input.weights), useCase);
   const mergedConstraints = mergeConstraints(input.constraints, useCase.constraints);
   const filtered = filterMaterials(mergedConstraints, materials);
@@ -354,82 +441,39 @@ export function generateCandidates(input: SessionInput, materials: Material[] = 
   const materialById = new Map(filtered.map((m) => [m.id, m]));
 
   const top = filtered
-    .map((m) => ({ material: m, sim: cosineSimilarity(target, m.properties) }))
-    .sort((a, b) => b.sim - a.sim)
+    .map((m) => {
+      const sim = cosineSimilarity(target, m.properties);
+      const useCaseBoost = materialUseCaseAffinity(m, useCase) * (0.9 + neutrality);
+      return { material: m, sim, rankScore: sim + useCaseBoost };
+    })
+    .sort((a, b) => b.rankScore - a.rankScore)
     .slice(0, Math.max(8, Math.min(14, filtered.length)));
 
   const out: Candidate[] = [];
+  const seenCompositions = new Set<string>();
 
-  for (let i = 0; i < 6; i += 1) {
-    const base = top[i % top.length].material;
-    const secondary = top[(i + 2) % top.length].material;
-    const additivePool = filtered.filter(
-      (m) =>
-        (m.category === "BioPolymer" || m.category === "Synthetic" || m.category === "MMCF") &&
-        !(useCase.constraints?.no_elastane && hasElastomer(m.name))
-    );
-    const additive = additivePool[Math.floor(rand() * additivePool.length)] ?? top[(i + 3) % top.length].material;
+  function pushCandidate(composition: CompositionPart[]): void {
+    const normalizedComposition = normalizeComposition(composition);
+    const key = compositionKey(normalizedComposition);
+    if (seenCompositions.has(key)) return;
+    seenCompositions.add(key);
 
-    const composition = makeComposition(base, secondary, additive, rand);
-    const { predicted_properties, predicted_lca, feasibility } = predictBlend(composition, materialById);
-
-    const avgCost = composition.reduce((sum, part) => {
+    const { predicted_properties, predicted_lca, feasibility } = predictBlend(normalizedComposition, materialById);
+    const avgCost = normalizedComposition.reduce((sum, part) => {
       const mat = materialById.get(part.material_id);
       if (!mat) return sum;
       return sum + (((mat.cost_min + mat.cost_max) / 2) * part.pct) / 100;
     }, 0);
     predicted_properties.cost = clampCostToScore(avgCost) as Record<MetricKey, number>["cost"];
     predicted_properties.scalability = Number((feasibility.trl_est * 11.11).toFixed(1)) as Record<MetricKey, number>["scalability"];
-    const circularity = evaluateCircularity(composition, materialById, predicted_properties);
+    const circularity = evaluateCircularity(normalizedComposition, materialById, predicted_properties);
 
     let score = weightedCloseness(predicted_properties, target, weights);
-    const useCaseObjective = candidateUseCaseObjective(
-      {
-        rank: i + 1,
-        score,
-        scores: { performance_0_10: 0, sustainability_0_10: 0, feasibility_0_10: 0, overall_0_100: 0 },
-        composition,
-        predicted_properties,
-        predicted_lca,
-        feasibility,
-        circularity,
-        explanation: "",
-        manufacturing_notes: [],
-        risks: []
-      },
-      useCase
-    );
-    score = score * 0.55 + useCaseObjective * 0.45;
-    if (feasibility.supply_risk === "high") score -= 0.08;
-    if (feasibility.trl_est < 6) score -= 0.05;
-    score -= (10 - circularity.circularity_score) * 0.012;
-    if (circularity.eol_pathway === "LANDFILL_RISK") score -= 0.06;
-    const candidateBase: Candidate = {
-      rank: i + 1,
-      score: Number((score + applyUseCasePenaltiesAndBonuses(
-        {
-          rank: i + 1,
-          score,
-          scores: { performance_0_10: 0, sustainability_0_10: 0, feasibility_0_10: 0, overall_0_100: 0 },
-          composition,
-          predicted_properties,
-          predicted_lca,
-          feasibility,
-          circularity,
-          explanation: "",
-          manufacturing_notes: [],
-          risks: []
-        },
-        useCase,
-        materialById
-      )).toFixed(4)),
-      scores: {
-        performance_0_10: 0,
-        sustainability_0_10: 0,
-        feasibility_0_10: 0,
-        overall_0_100: 0
-      },
-      composition,
+    const baseCandidate: Candidate = {
+      rank: out.length + 1,
+      score,
+      scores: { performance_0_10: 0, sustainability_0_10: 0, feasibility_0_10: 0, overall_0_100: 0 },
+      composition: normalizedComposition,
       predicted_properties,
       predicted_lca,
       feasibility,
@@ -439,9 +483,51 @@ export function generateCandidates(input: SessionInput, materials: Material[] = 
       risks: []
     };
 
-    const llmFields = buildExplanation(candidateBase);
-    const scores = computeCompositeScores(candidateBase);
-    out.push({ ...candidateBase, ...llmFields, scores });
+    const useCaseObjective = candidateUseCaseObjective(baseCandidate, useCase);
+    score = score * 0.55 + useCaseObjective * 0.45;
+    if (feasibility.supply_risk === "high") score -= 0.08;
+    if (feasibility.trl_est < 6) score -= 0.05;
+    score -= (10 - circularity.circularity_score) * 0.012;
+    if (circularity.eol_pathway === "LANDFILL_RISK") score -= 0.06;
+    score += applyUseCasePenaltiesAndBonuses(baseCandidate, useCase, materialById);
+
+    const candidateWithScore: Candidate = {
+      ...baseCandidate,
+      score: Number(score.toFixed(4))
+    };
+    const llmFields = buildExplanation(candidateWithScore);
+    const scores = computeCompositeScores(candidateWithScore);
+    out.push({ ...candidateWithScore, ...llmFields, scores });
+  }
+
+  // Add single-material options when a material already fits the target very well.
+  for (const entry of top) {
+    if (entry.sim < 0.92 || out.length >= 2) break;
+    if (materialUseCaseAffinity(entry.material, useCase) < -0.02) continue;
+    pushCandidate(makeSingleMaterialComposition(entry.material));
+  }
+
+  const additivePoolAll = filtered.filter(
+    (m) =>
+      (m.category === "BioPolymer" || m.category === "Synthetic" || m.category === "MMCF") &&
+      !(useCase.constraints?.no_elastane && hasElastomer(m.name))
+  );
+
+  let attempts = 0;
+  while (out.length < 6 && attempts < 48) {
+    const i = attempts;
+    const base = top[i % top.length].material;
+    const secondary =
+      pickDistinctMaterial(top.map((x) => x.material), new Set([base.id])) ??
+      pickDistinctMaterial(filtered, new Set([base.id])) ??
+      base;
+    const additive =
+      pickDistinctMaterial(additivePoolAll, new Set([base.id, secondary.id])) ??
+      pickDistinctMaterial(filtered, new Set([base.id, secondary.id])) ??
+      secondary;
+
+    pushCandidate(makeComposition(base, secondary, additive, rand));
+    attempts += 1;
   }
 
   return out

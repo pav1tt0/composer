@@ -1,3 +1,5 @@
+import type { MetricKey } from "@/lib/types";
+
 export type UseCaseCategory =
   | "APPAREL_PERFORMANCE"
   | "APPAREL_FASHION"
@@ -44,6 +46,7 @@ export type UseCaseConfig = {
   description: string;
   score_weights: ScoreWeights;
   property_bias: PropertyBias;
+  target_hint?: Partial<Record<MetricKey, number>>;
   constraints?: EolConstraint;
   material_preferences?: MaterialPreference;
   bonuses?: {
