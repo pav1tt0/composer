@@ -54,6 +54,7 @@ export type GenerateConstraints = {
 
 export type SessionInput = {
   use_case: string;
+  use_case_id?: string;
   sliders: SlidersInput;
   weights?: WeightsInput;
   constraints?: GenerateConstraints;

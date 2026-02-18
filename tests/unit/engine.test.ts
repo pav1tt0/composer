@@ -75,6 +75,26 @@ describe("engine", () => {
     expect(highDurability[0].composition).not.toStrictEqual(highCost[0].composition);
   });
 
+  it("changing use-case changes ranking", () => {
+    const payload = {
+      sliders: { durability: 68, elasticity: 64, softness: 58, recyclability: 62 },
+      constraints: { no_animal_fibers: true }
+    };
+
+    const cycling = generateCandidates({
+      use_case: "Cycling Apparel",
+      use_case_id: "cycling-apparel",
+      ...payload
+    });
+    const circular = generateCandidates({
+      use_case: "Circular Design",
+      use_case_id: "circular-design",
+      ...payload
+    });
+
+    expect(cycling[0].composition).not.toStrictEqual(circular[0].composition);
+  });
+
   it("adds circularity outputs to each candidate", () => {
     const out = generateCandidates({ use_case: "Sportswear", sliders: { durability: 70, elasticity: 60 } });
     expect(out[0].circularity.recyclability_score).toBeGreaterThanOrEqual(0);

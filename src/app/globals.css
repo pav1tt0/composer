@@ -304,6 +304,17 @@ button.ghost {
 }
 
 .similar-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.similar-result {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid #7ea993;
+  background: #e6f6ee;
+  color: #12372b;
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
 .error { color: var(--danger); }
 small.muted { color: var(--muted); }
 

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { Suspense, useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 import type { Candidate } from "@/lib/types";
+import { parseStoredCandidates } from "@/lib/compare-storage";
 
 type Row = { key: string; label: string; get: (c: Candidate) => number | string };
 
@@ -28,8 +29,7 @@ function CompareContent() {
   const selected = useMemo(() => {
     if (typeof window === "undefined") return [] as Candidate[];
     const raw = localStorage.getItem("amc_last_candidates");
-    if (!raw) return [] as Candidate[];
-    const all = JSON.parse(raw) as Candidate[];
+    const all = parseStoredCandidates(raw);
     return all.filter((c) => selectedRanks.includes(c.rank)).slice(0, 4);
   }, [idsParam]);
 

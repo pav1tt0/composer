@@ -11,6 +11,8 @@ import type {
   SessionInput
 } from "@/lib/types";
 import { PERFORMANCE_METRICS, SUSTAINABILITY_METRICS } from "@/lib/types";
+import { getUseCaseById, resolveUseCaseId } from "@/lib/use-cases";
+import type { EolConstraint, UseCaseConfig } from "@/lib/types/useCase";
 
 const MAX_MICROPLASTIC_ORDER: Record<"low" | "medium" | "high", number> = {
   low: 1,
@@ -38,6 +40,99 @@ function filterMaterials(constraints: GenerateConstraints | undefined, materials
     if (typeof constraints?.max_cost === "number" && m.cost_min > constraints.max_cost) return false;
     return true;
   });
+}
+
+function categoryFamily(category: Material["category"]): string {
+  if (category === "MMCF") return "CELLULOSIC";
+  if (category === "Bast") return "BAST";
+  if (category === "Natural") return "NATURAL";
+  if (category === "Synthetic") return "SYNTHETIC";
+  if (category === "BioPolymer") return "BIOPOLYMER";
+  return "PROTEIN";
+}
+
+function mergeConstraints(input: GenerateConstraints | undefined, useCaseConstraints: EolConstraint | undefined): GenerateConstraints {
+  const merged: GenerateConstraints = { ...(input ?? {}) };
+  const risk = useCaseConstraints?.max_microplastic_risk;
+  if (typeof risk === "number") {
+    const mapped: GenerateConstraints["max_microplastic_risk"] = risk <= 4 ? "low" : risk <= 7 ? "medium" : "high";
+    const existing = merged.max_microplastic_risk;
+    if (!existing || MAX_MICROPLASTIC_ORDER[mapped] < MAX_MICROPLASTIC_ORDER[existing]) {
+      merged.max_microplastic_risk = mapped;
+    }
+  }
+  return merged;
+}
+
+function adjustWeightsForUseCase(baseWeights: Record<MetricKey, number>, useCase: UseCaseConfig): Record<MetricKey, number> {
+  const out = { ...baseWeights };
+  for (const [metric, bias] of Object.entries(useCase.property_bias)) {
+    const key = metric as keyof UseCaseConfig["property_bias"] & MetricKey;
+    out[key] = out[key] * (1 + Math.max(0, Math.min(1.5, Number(bias ?? 0))));
+  }
+  const sum = Object.values(out).reduce((a, b) => a + b, 0);
+  if (sum <= 0) return baseWeights;
+  for (const key of Object.keys(out) as MetricKey[]) out[key] = out[key] / sum;
+  return out;
+}
+
+function candidateUseCaseObjective(candidate: Candidate, useCase: UseCaseConfig): number {
+  const perf = avg(PERFORMANCE_METRICS.map((k) => candidate.predicted_properties[k] ?? 50)) / 100;
+  const sust = avg(SUSTAINABILITY_METRICS.map((k) => candidate.predicted_properties[k] ?? 50)) / 100;
+  const circ = candidate.circularity.circularity_score / 10;
+  const cost = (candidate.predicted_properties.cost ?? 50) / 100;
+  const feasibility =
+    (avg([candidate.predicted_properties.scalability ?? 50, candidate.predicted_properties.cost ?? 50]) * 0.6 +
+      (candidate.feasibility.trl_est / 9) * 100 * 0.4) /
+    100;
+
+  return (
+    useCase.score_weights.performance * perf +
+    useCase.score_weights.sustainability * sust +
+    useCase.score_weights.circularity * circ +
+    useCase.score_weights.cost * cost +
+    useCase.score_weights.feasibility * feasibility
+  );
+}
+
+function applyUseCasePenaltiesAndBonuses(candidate: Candidate, useCase: UseCaseConfig, materialById: Map<string, Material>): number {
+  let delta = 0;
+  const constraints = useCase.constraints;
+  const composition = candidate.composition;
+  const components = composition.filter((p) => p.pct > 0).length;
+  const hasAnyElastomer = composition.some((p) => hasElastomer(p.name));
+
+  if (constraints?.no_elastane && hasAnyElastomer) delta -= 0.12;
+  if (constraints?.prefer_monomaterial && components > 2) delta -= 0.05;
+  if (typeof constraints?.must_be_recyclable_min === "number") {
+    const gap = constraints.must_be_recyclable_min - candidate.circularity.recyclability_score;
+    if (gap > 0) delta -= gap * 0.03;
+  }
+  if (typeof constraints?.max_microplastic_risk === "number") {
+    const gap = candidate.circularity.microplastic_risk - constraints.max_microplastic_risk;
+    if (gap > 0) delta -= gap * 0.03;
+  }
+
+  const preferred = new Set((useCase.material_preferences?.preferred_families ?? []).map((v) => v.toUpperCase()));
+  const discouraged = new Set((useCase.material_preferences?.discouraged_families ?? []).map((v) => v.toUpperCase()));
+  let preferredShare = 0;
+  let discouragedShare = 0;
+
+  for (const part of composition) {
+    const m = materialById.get(part.material_id);
+    if (!m) continue;
+    const family = categoryFamily(m.category);
+    if (preferred.has(family)) preferredShare += part.pct;
+    if (discouraged.has(family)) discouragedShare += part.pct;
+  }
+
+  delta += (preferredShare / 100) * 0.09;
+  delta -= (discouragedShare / 100) * 0.1;
+
+  if (components <= 2) delta += (useCase.bonuses?.monomaterial_bonus ?? 0) / 100;
+  if (candidate.circularity.microplastic_risk <= 4) delta += (useCase.bonuses?.low_microplastic_bonus ?? 0) / 100;
+
+  return delta;
 }
 
 function mulberry32(seed: number): () => number {
@@ -244,9 +339,12 @@ export function findSimilarMaterialsFromCatalog(catalog: Material[], targetMater
 }
 
 export function generateCandidates(input: SessionInput, materials: Material[] = MATERIALS): Candidate[] {
+  const useCaseId = resolveUseCaseId(input);
+  const useCase = getUseCaseById(useCaseId);
   const target = normalizeSliders(input.sliders);
-  const weights = normalizeWeights(input.weights);
-  const filtered = filterMaterials(input.constraints, materials);
+  const weights = adjustWeightsForUseCase(normalizeWeights(input.weights), useCase);
+  const mergedConstraints = mergeConstraints(input.constraints, useCase.constraints);
+  const filtered = filterMaterials(mergedConstraints, materials);
   if (filtered.length < 3) {
     throw new Error("Not enough materials after applying constraints");
   }
@@ -265,7 +363,11 @@ export function generateCandidates(input: SessionInput, materials: Material[] = 
   for (let i = 0; i < 6; i += 1) {
     const base = top[i % top.length].material;
     const secondary = top[(i + 2) % top.length].material;
-    const additivePool = filtered.filter((m) => m.category === "BioPolymer" || m.category === "Synthetic" || m.category === "MMCF");
+    const additivePool = filtered.filter(
+      (m) =>
+        (m.category === "BioPolymer" || m.category === "Synthetic" || m.category === "MMCF") &&
+        !(useCase.constraints?.no_elastane && hasElastomer(m.name))
+    );
     const additive = additivePool[Math.floor(rand() * additivePool.length)] ?? top[(i + 3) % top.length].material;
 
     const composition = makeComposition(base, secondary, additive, rand);
@@ -281,14 +383,46 @@ export function generateCandidates(input: SessionInput, materials: Material[] = 
     const circularity = evaluateCircularity(composition, materialById, predicted_properties);
 
     let score = weightedCloseness(predicted_properties, target, weights);
+    const useCaseObjective = candidateUseCaseObjective(
+      {
+        rank: i + 1,
+        score,
+        scores: { performance_0_10: 0, sustainability_0_10: 0, feasibility_0_10: 0, overall_0_100: 0 },
+        composition,
+        predicted_properties,
+        predicted_lca,
+        feasibility,
+        circularity,
+        explanation: "",
+        manufacturing_notes: [],
+        risks: []
+      },
+      useCase
+    );
+    score = score * 0.55 + useCaseObjective * 0.45;
     if (feasibility.supply_risk === "high") score -= 0.08;
     if (feasibility.trl_est < 6) score -= 0.05;
     score -= (10 - circularity.circularity_score) * 0.012;
     if (circularity.eol_pathway === "LANDFILL_RISK") score -= 0.06;
-
-    const candidate: Candidate = {
+    const candidateBase: Candidate = {
       rank: i + 1,
-      score: Number(score.toFixed(4)),
+      score: Number((score + applyUseCasePenaltiesAndBonuses(
+        {
+          rank: i + 1,
+          score,
+          scores: { performance_0_10: 0, sustainability_0_10: 0, feasibility_0_10: 0, overall_0_100: 0 },
+          composition,
+          predicted_properties,
+          predicted_lca,
+          feasibility,
+          circularity,
+          explanation: "",
+          manufacturing_notes: [],
+          risks: []
+        },
+        useCase,
+        materialById
+      )).toFixed(4)),
       scores: {
         performance_0_10: 0,
         sustainability_0_10: 0,
@@ -305,9 +439,9 @@ export function generateCandidates(input: SessionInput, materials: Material[] = 
       risks: []
     };
 
-    const llmFields = buildExplanation(candidate);
-    const scores = computeCompositeScores(candidate);
-    out.push({ ...candidate, ...llmFields, scores });
+    const llmFields = buildExplanation(candidateBase);
+    const scores = computeCompositeScores(candidateBase);
+    out.push({ ...candidateBase, ...llmFields, scores });
   }
 
   return out

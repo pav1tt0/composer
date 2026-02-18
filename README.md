@@ -1,6 +1,7 @@
 # AI Material Composer (MVP)
 
 Next.js app that generates material blend candidates from slider targets and constraints.
+The Composer uses an intelligent use-case profile system (grouped/searchable selector) that influences ranking and constraints.
 
 ## Stack
 - Next.js (App Router, TypeScript)
@@ -42,3 +43,7 @@ Supported schemas:
 - `POST /api/similar`
 
 Note: in read-only mode `history` and `session` are in-memory for the current server run.
+
+`POST /api/generate` accepts:
+- `use_case_id` (new, preferred; config-driven)
+- `use_case` (legacy label, still supported and mapped to `use_case_id`)

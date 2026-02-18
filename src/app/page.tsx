@@ -6,6 +6,9 @@ import type { Candidate, MetricKey } from "@/lib/types";
 import { ALL_METRICS } from "@/lib/types";
 import { detectConflicts } from "@/lib/conflicts";
 import { ResultCard } from "@/components/ResultCard";
+import { DEFAULT_USE_CASE_ID, USE_CASE_CATEGORY_LABELS } from "@/lib/config/useCases";
+import { getUseCaseById, getUseCaseGroups } from "@/lib/use-cases";
+import type { UseCaseCategory } from "@/lib/types/useCase";
 
 const defaults: Partial<Record<MetricKey, number>> = {
   breathability: 70,
@@ -32,11 +35,13 @@ const priorityOptions: MetricKey[] = [
 ];
 
 function prettyMetric(key: string): string {
+  if (key === "cost") return "Cost importance";
   return key.replaceAll("_", " ");
 }
 
 export default function ComposerPage() {
-  const [useCase, setUseCase] = useState("Sportswear");
+  const [useCaseId, setUseCaseId] = useState(DEFAULT_USE_CASE_ID);
+  const [useCaseCategory, setUseCaseCategory] = useState<UseCaseCategory | "ALL">("ALL");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -52,6 +57,15 @@ export default function ComposerPage() {
   const [compareRanks, setCompareRanks] = useState<number[]>([]);
   const resultsRef = useRef<HTMLElement | null>(null);
 
+  const selectedUseCase = useMemo(() => getUseCaseById(useCaseId), [useCaseId]);
+  const groupedUseCases = useMemo(() => {
+    const groups = getUseCaseGroups({ category: useCaseCategory });
+    return groups.length ? groups : getUseCaseGroups({ category: useCaseCategory });
+  }, [useCaseCategory]);
+  const shownUseCases = useMemo(
+    () => groupedUseCases.reduce((sum, group) => sum + group.items.length, 0),
+    [groupedUseCases]
+  );
   const sliderEntries = useMemo(() => Object.entries(values), [values]);
   const conflicts = useMemo(() => detectConflicts(values), [values]);
 
@@ -59,6 +73,17 @@ export default function ComposerPage() {
     if (!candidates.length) return;
     localStorage.setItem("amc_last_candidates", JSON.stringify(candidates));
   }, [candidates]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = window.sessionStorage.getItem("amc_use_case_id");
+    if (stored) setUseCaseId(stored);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.sessionStorage.setItem("amc_use_case_id", useCaseId);
+  }, [useCaseId]);
 
   function clampPercent(value: number): number {
     if (!Number.isFinite(value)) return 0;
@@ -107,7 +132,8 @@ export default function ComposerPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          use_case: useCase,
+          use_case: selectedUseCase.label,
+          use_case_id: selectedUseCase.id,
           sliders: values,
           weights: buildWeights(),
           constraints: {
@@ -175,7 +201,8 @@ export default function ComposerPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         input: {
-          use_case: useCase,
+          use_case: selectedUseCase.label,
+          use_case_id: selectedUseCase.id,
           sliders: values,
           weights: buildWeights(),
           constraints: {
@@ -234,7 +261,7 @@ export default function ComposerPage() {
             <div className="similar-row">
               <button className="ghost" onClick={() => onFindSimilar(candidate)}>Find similar</button>
               <button className="ghost" onClick={() => onSuggestRecyclable(candidate)}>Suggest more recyclable alternative</button>
-              {similar[candidate.rank]?.length ? <small className="muted">Similar: {similar[candidate.rank].join(", ")}</small> : null}
+              {similar[candidate.rank]?.length ? <span className="similar-result">Similar: {similar[candidate.rank].join(", ")}</span> : null}
             </div>
             {recyclableAlternatives[candidate.rank] ? (
               <div>
@@ -252,12 +279,27 @@ export default function ComposerPage() {
 
         <div className="control-group">
           <label>Use case</label>
-          <select value={useCase} onChange={(e) => setUseCase(e.target.value)}>
-            <option>Sportswear</option>
-            <option>Denim</option>
-            <option>Luxury</option>
-            <option>Interior</option>
+          <select value={useCaseCategory} onChange={(e) => setUseCaseCategory(e.target.value as UseCaseCategory | "ALL")}>
+            <option value="ALL">All categories</option>
+            {Object.entries(USE_CASE_CATEGORY_LABELS).map(([key, label]) => (
+              <option key={key} value={key}>
+                {label}
+              </option>
+            ))}
           </select>
+          <small className="muted">{shownUseCases} use-cases shown</small>
+          <select value={useCaseId} onChange={(e) => setUseCaseId(e.target.value)}>
+            {groupedUseCases.map((group) => (
+              <optgroup key={group.category} label={USE_CASE_CATEGORY_LABELS[group.category as keyof typeof USE_CASE_CATEGORY_LABELS]}>
+                {group.items.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+          <small className="muted">{selectedUseCase.description}</small>
         </div>
 
         <div className="control-group">
@@ -329,7 +371,7 @@ export default function ComposerPage() {
           <label className="check">
             <input type="checkbox" checked={noAnimal} onChange={(e) => setNoAnimal(e.target.checked)} /> No animal fibers
           </label>
-          <label>Max cost EUR/kg</label>
+          <label>Max acceptable cost (€/kg)</label>
           <input type="number" min={1} max={30} value={maxCost} onChange={(e) => setMaxCost(Number(e.target.value))} />
         </div>
 
